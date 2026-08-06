@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Queue — Food Scanner</title>
+<style>
+  :root {
+    --bg: #0D0D12; --surface: #1A1A22; --surface2: #22222C; --border: #2A2A38;
+    --amber: #E8C34A; --green: #4ECDA4; --red: #E85A4F; --text: #E4E4EC; --muted: #9A9AB0;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    min-height: 100vh; min-height: 100dvh; }
+  body { display: flex; flex-direction: column; }
+  header { padding: 14px 16px 10px; display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+  .back { color: var(--amber); font-size: 20px; text-decoration: none; padding: 4px 6px; }
+  .brand { font-size: 15px; font-weight: 600; }
+  .brand-sub { font-size: 11px; color: var(--muted); }
+  main { flex: 1; padding: 0 16px 16px; overflow-y: auto; }
+
+  .item { background: var(--surface); border-radius: 12px; padding: 14px 16px; margin-bottom: 10px; }
+  .item-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+  .item-name { font-size: 15px; font-weight: 600; }
+  .item-meta { font-size: 11.5px; color: var(--muted); margin-top: 3px; line-height: 1.5; }
+  .src-pill { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px;
+    padding: 2px 7px; border-radius: 10px; background: var(--surface2); color: var(--muted); }
+  .remove-btn { background: none; border: none; color: var(--red); font-size: 13px; cursor: pointer; padding: 4px 8px; flex-shrink: 0; }
+  .nutrients-strip { display: flex; gap: 12px; margin-top: 8px; font-size: 11.5px; color: var(--muted); flex-wrap: wrap; }
+  .nutrients-strip b { color: var(--text); }
+
+  .empty-state { text-align: center; padding: 60px 20px; color: var(--muted); }
+  .empty-state .big { font-size: 36px; display: block; margin-bottom: 12px; }
+  .empty-state a { color: var(--amber); text-decoration: none; font-weight: 600; }
+
+  .export-bar { flex-shrink: 0; padding: 12px 16px calc(14px + env(safe-area-inset-bottom));
+    background: var(--surface); border-top: 1px solid var(--border); }
+  .btn { width: 100%; padding: 14px; border-radius: 12px; border: none; font-size: 15px; font-weight: 600; cursor: pointer; }
+  .btn-primary { background: var(--amber); color: #14140F; }
+  .btn:disabled { opacity: 0.4; }
+  .export-note { font-size: 11px; color: var(--muted); text-align: center; margin-top: 8px; line-height: 1.5; }
+</style>
+</head>
+<body>
+
+<header>
+  <a href="index.html" class="back">←</a>
+  <div>
+    <div class="brand">Scan queue</div>
+    <div class="brand-sub" id="queue-summary">—</div>
+  </div>
+</header>
+
+<main id="queue-list"></main>
+
+<div class="export-bar">
+  <button class="btn btn-primary" id="export-btn" onclick="exportQueue()">Export batch as JSON</button>
+  <div class="export-note">AirDrop the file to your Mac, then Import it in GeometricHealth. Nothing leaves this device until you export.</div>
+</div>
+
+<script>
+let queue = JSON.parse(localStorage.getItem('foodScannerQueue') || '[]');
+render();
+
+function render() {
+  const list = document.getElementById('queue-list');
+  const summary = document.getElementById('queue-summary');
+  const exportBtn = document.getElementById('export-btn');
+
+  if (!queue.length) {
+    summary.textContent = 'Nothing queued yet';
+    exportBtn.disabled = true;
+    list.innerHTML = `
+      <div class="empty-state">
+        <span class="big">◇</span>
+        Nothing scanned yet.<br>
+        <a href="index.html">Scan something →</a>
+      </div>`;
+    return;
+  }
+
+  const eatenCount = queue.filter(i => i.consumedAt).length;
+  const stockCount = queue.length - eatenCount;
+  summary.textContent = `${queue.length} item${queue.length !== 1 ? 's' : ''}` +
+    (stockCount ? ` · ${stockCount} not yet eaten` : '');
+
+  list.innerHTML = queue.map((item, idx) => {
+    const scannedDate = new Date(item.scannedAt);
+    const consumedLabel = item.consumedAt
+      ? 'Consumed ' + formatDateTime(item.consumedAt)
+      : 'Not yet eaten — stock';
+    const srcLabel = { barcode: 'Barcode', package_ocr: 'Label', package_manual: 'Manual', plate_vision: 'Plate', plate_manual: 'Manual' }[item.source] || item.source;
+
+    const n = item.nutrients || {};
+    const strip = [
+      n.kcal != null ? `<span><b>${n.kcal}</b> kcal</span>` : '',
+      n.sugar_g != null ? `<span><b>${n.sugar_g}g</b> sugar</span>` : '',
+      n.protein_g != null ? `<span><b>${n.protein_g}g</b> protein</span>` : '',
+      n.salt_g != null ? `<span><b>${n.salt_g}g</b> salt</span>` : ''
+    ].filter(Boolean).join('');
+
+    return `
+      <div class="item">
+        <div class="item-top">
+          <div>
+            <div class="item-name">${escapeHtml(item.name)}</div>
+            <div class="item-meta">
+              <span class="src-pill">${srcLabel}</span> &nbsp;${consumedLabel}${item.portionEstimate ? ' · ' + escapeHtml(item.portionEstimate) : ''}
+            </div>
+          </div>
+          <button class="remove-btn" onclick="removeItem(${idx})">Remove</button>
+        </div>
+        ${strip ? `<div class="nutrients-strip">${strip}</div>` : '<div class="nutrients-strip">No nutrient values recorded</div>'}
+      </div>`;
+  }).join('');
+}
+
+function removeItem(idx) {
+  queue.splice(idx, 1);
+  localStorage.setItem('foodScannerQueue', JSON.stringify(queue));
+  render();
+}
+
+function formatDateTime(iso) {
+  const d = new Date(iso);
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' +
+    d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+}
+function escapeHtml(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+
+function exportQueue() {
+  if (!queue.length) return;
+  const payload = {
+    exportVersion: '1.0',
+    exportedAt: new Date().toISOString(),
+    itemCount: queue.length,
+    items: queue
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const dateStr = new Date().toISOString().slice(0,10);
+  a.href = url;
+  a.download = `food-scan-batch-${dateStr}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+
+  // Ask before clearing — exporting shouldn't silently wipe the queue in case
+  // the AirDrop/save step fails and the person needs to export again.
+  setTimeout(() => {
+    if (confirm(`Exported ${queue.length} item(s). Clear the queue now?\n\n(Only do this after you've confirmed the file saved/transferred successfully.)`)) {
+      queue = [];
+      localStorage.setItem('foodScannerQueue', JSON.stringify(queue));
+      render();
+    }
+  }, 400);
+}
+</script>
+</body>
+</html>
