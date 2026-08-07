@@ -187,28 +187,35 @@ function setMode(mode) {
 
 // ========================= Camera lifecycle =========================
 async function startCamera() {
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 960 } }
-    });
-  } catch (e) {
-    showToast('Camera access failed — check permissions, or use "Upload photo" instead.');
-    return;
-  }
   const video = document.getElementById('video');
-  video.srcObject = stream;
-  video.style.display = 'block';
   document.getElementById('stage-placeholder').style.display = 'none';
   document.getElementById('captured-img').style.display = 'none';
   document.getElementById('btn-start').style.display = 'none';
   document.getElementById('btn-retake').style.display = 'none';
+  video.style.display = 'block';
 
   if (currentMode === 'barcode') {
+    // Barcode mode: let ZXing own the camera stream via decodeFromConstraints.
+    // decodeFromVideoElement (used previously) expects to control the stream's
+    // lifecycle itself — handing it a <video> whose srcObject was already set
+    // via a separate getUserMedia call is a known unreliable combination on
+    // iOS Safari specifically, producing zero decode attempts with no visible
+    // error. decodeFromConstraints avoids that by requesting the stream itself.
     document.getElementById('scan-frame').style.display = 'block';
     document.getElementById('scan-line').style.display = 'block';
     document.getElementById('btn-capture').style.display = 'none';
     startBarcodeDecoding(video);
   } else {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 960 } }
+      });
+    } catch (e) {
+      showToast('Camera access failed — check permissions, or use "Upload photo" instead.');
+      retake();
+      return;
+    }
+    video.srcObject = stream;
     document.getElementById('scan-frame').style.display = 'block';
     document.getElementById('scan-line').style.display = 'none';
     document.getElementById('btn-capture').style.display = 'block';
@@ -220,6 +227,7 @@ function stopCamera() {
   if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
   scanning = false;
   const video = document.getElementById('video');
+  video.srcObject = null;
   video.style.display = 'none';
   document.getElementById('scan-frame').style.display = 'none';
   document.getElementById('scan-line').style.display = 'none';
@@ -241,7 +249,7 @@ function retake() {
 function startBarcodeDecoding(video) {
   const status = document.getElementById('stage-status');
   status.style.display = 'block';
-  status.textContent = 'Looking for a barcode…';
+  status.textContent = 'Starting camera…';
   scanning = true;
 
   const hints = new Map();
@@ -253,16 +261,20 @@ function startBarcodeDecoding(video) {
   hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats);
   zxingReader = new ZXing.BrowserMultiFormatReader(hints);
 
-  zxingReader.decodeFromVideoElement(video, (result, err) => {
+  const constraints = { video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 960 } } };
+
+  zxingReader.decodeFromConstraints(constraints, video, (result, err) => {
     if (!scanning) return;
+    status.textContent = 'Looking for a barcode…';
     if (result) {
       scanning = false;
       status.textContent = 'Found: ' + result.getText();
       navigator.vibrate && navigator.vibrate(80);
       handleBarcodeResult(result.getText());
     }
-  }).catch(() => {
-    status.textContent = 'Decoder unavailable — try "Upload photo" instead.';
+  }).catch((err) => {
+    status.textContent = 'Camera/decoder unavailable — try "Upload photo" instead.';
+    showToast('Barcode scanning failed to start — try Upload photo, or Retake.');
   });
 }
 
@@ -431,14 +443,23 @@ function finishCapture() {
 // ========================= Package mode: OCR =========================
 async function runOCR(dataUrl) {
   try {
-    const result = await Tesseract.recognize(dataUrl, 'eng');
+    // Tesseract.js needs explicit paths to its worker script, WASM core, and
+    // language data — without these, it tries to guess paths relative to the
+    // page's own origin and throws immediately on recognize(), which is what
+    // was happening here (every scan hit the catch block below, regardless
+    // of image quality). Pinning these to the same CDN version fixes it.
+    const result = await Tesseract.recognize(dataUrl, 'eng', {
+      workerPath: 'https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.0.4/worker.min.js',
+      corePath: 'https://cdnjs.cloudflare.com/ajax/libs/tesseract.js-core/5.0.0/tesseract-core.wasm.js',
+      langPath: 'https://tessdata.projectnaptha.com/4.0.0'
+    });
     const text = result.data.text;
     const parsed = parseNutritionText(text);
     renderPackageReview(parsed, text);
   } catch (e) {
     document.getElementById('review-container').innerHTML = `
       <div class="review"><h3>OCR failed</h3>
-      <p style="color:var(--muted); font-size:13px;">Could not read the label. Try retaking with better lighting and the label filling the frame, or enter values manually below.</p>
+      <p style="color:var(--muted); font-size:13px;">Could not read the label (${escapeHtml(String(e.message || e))}). Try retaking with better lighting and the label filling the frame, or enter values manually below.</p>
       </div>` + buildManualPackageForm();
     bindManualPackageHandlers();
   }
@@ -456,27 +477,63 @@ function normalizeOcrText(text) {
     .replace(/(\d)O(\d)/g, '$1' + '0' + '$2'); // "1O0" -> "100"
 }
 
+// Plausible per-100g ceilings for each nutrient — anything above this on a real
+// UK nutrition label is almost certainly a decimal point OCR failure (e.g. "13.8"
+// misread as "138") rather than a genuine value, since these are physical
+// maximums for what 100g of any real food can contain. This is a safety net,
+// not the primary parsing strategy — a plausible OCR number is trusted as-is.
+const NUTRIENT_PLAUSIBLE_MAX = {
+  kcal: 900, fat_g: 100, saturates_g: 100, carbs_g: 100,
+  sugar_g: 100, fibre_g: 100, protein_g: 100, salt_g: 30
+};
+
+function sanityCheckNutrient(key, val) {
+  if (val == null) return { value: null };
+  const ceiling = NUTRIENT_PLAUSIBLE_MAX[key];
+  if (ceiling != null && val > ceiling) {
+    // Try repairing an apparently lost decimal point (e.g. 138 -> 13.8).
+    // If the repaired value is still implausible, this wasn't a simple
+    // decimal-loss case — reject to null rather than guess further.
+    const corrected = Math.round((val / 10) * 10) / 10;
+    if (corrected <= ceiling) return { value: corrected, flag: 'corrected_decimal' };
+    return { value: null, flag: 'rejected_implausible' };
+  }
+  return { value: val };
+}
+
 function parseNutritionText(rawText) {
   // Best-effort pattern matching for a UK-style "Typical values / Per 100g" panel.
   // Anything not confidently matched stays null — never guessed.
   const text = normalizeOcrText(rawText);
   const grab = (re) => { const m = text.match(re); return m ? parseFloat(m[1]) : null; };
-  return {
+  const rawValues = {
     kcal: grab(/(\d+(?:\.\d+)?)\s*kcal/i),
-    fat_g: grab(/fat[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*g/i),
+    fat_g: grab(/\bfat[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*g/i),
     saturates_g: grab(/saturat\w*[^\d\n]{0,20}(\d+(?:\.\d+)?)\s*g/i),
     carbs_g: grab(/carbohydrate[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*g/i),
     sugar_g: grab(/sugars?[^\d\n]{0,20}(\d+(?:\.\d+)?)\s*g/i),
     fibre_g: grab(/fibre[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*g/i),
     protein_g: grab(/protein[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*g/i),
     salt_g: grab(/salt[^\d\n]{0,15}(\d+(?:\.\d+)?)\s*g/i),
-    rawText: text
   };
+  const values = { rawText: text };
+  const flags = {};
+  Object.keys(rawValues).forEach(key => {
+    const checked = sanityCheckNutrient(key, rawValues[key]);
+    values[key] = checked.value;
+    if (checked.flag) flags[key] = checked.flag;
+  });
+  values._flags = flags;
+  return values;
 }
 
 function renderPackageReview(parsed, rawText) {
-  const readCount = Object.entries(parsed).filter(([k,v]) => k !== 'rawText' && v != null).length;
+  const readCount = Object.entries(parsed).filter(([k,v]) => k !== 'rawText' && k !== '_flags' && v != null).length;
   const confidence = readCount >= 6 ? 'high' : readCount >= 3 ? 'medium' : 'low';
+  const flags = parsed._flags || {};
+  const NUTRIENT_LABELS = { kcal:'kcal', fat_g:'Fat', saturates_g:'Saturates', carbs_g:'Carbs', sugar_g:'Sugar', fibre_g:'Fibre', protein_g:'Protein', salt_g:'Salt' };
+  const correctedFields = Object.keys(flags).filter(k => flags[k] === 'corrected_decimal').map(k => NUTRIENT_LABELS[k]);
+  const rejectedFields = Object.keys(flags).filter(k => flags[k] === 'rejected_implausible').map(k => NUTRIENT_LABELS[k]);
 
   const item = {
     id: 'item_' + Date.now(),
@@ -496,11 +553,20 @@ function renderPackageReview(parsed, rawText) {
     organic: null, gmStatus: null, ingredientsText: null, allergens: null
   };
 
+  let warningHtml = '';
+  if (correctedFields.length) {
+    warningHtml += `<p style="color:var(--amber); font-size:12px; margin-top:6px;">⚠ ${correctedFields.join(', ')} looked like a misread decimal point (e.g. "138" read as "13.8") — auto-corrected, please double-check against the label.</p>`;
+  }
+  if (rejectedFields.length) {
+    warningHtml += `<p style="color:var(--red); font-size:12px; margin-top:6px;">⚠ ${rejectedFields.join(', ')} read an implausible value and was left blank rather than guessed — enter it manually if you can read it.</p>`;
+  }
+
   const container = document.getElementById('review-container');
   container.innerHTML = `
     <div class="review">
       <h3>Label read — check it matches</h3>
       <p style="color:var(--muted); font-size:12px;">OCR read ${readCount} of 8 values. ${confidence === 'low' ? 'Low confidence — check every field carefully or retake with better lighting.' : ''}</p>
+      ${warningHtml}
     </div>` + buildReviewHtml(item, { showNameField: true, showConsumedNow: true });
   bindReviewHandlers(item);
 }
